@@ -16,6 +16,11 @@ const TITLE = 'Claude 監控'
 const ORDER_KEY = 'order'
 // 分類細項（本機估算）最快多久重算一次
 const BREAKDOWN_EVERY_MS = 4_000
+// 額度是整個帳號共用的：各 session 把讀到的數字放進共用儲存區，互相補最新的
+const LIMITS_KEY = 'limits-latest'
+const LIMITS_SYNC_MS = 30_000
+// 重置時間差在這之內視為同一個時間窗
+const SAME_WINDOW_MS = 5 * 60_000
 
 const usageAtom = atom({ plugin: 'token-meter', key: 'usage' } as const, null, {
   shape: 'usage-1',
@@ -119,9 +124,9 @@ const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '�
 
 // ---------- 方塊（tile） ----------
 
-type Tile = { id: string; label: string; remaining?: number; sub: string; resetsAt?: number }
+type Tile = { id: string; label: string; remaining?: number; sub: string; resetsAt?: number; isReset?: boolean }
 
-function tilesOf(usage: UsageSnap): Tile[] {
+function tilesOf(usage: UsageSnap, now: number): Tile[] {
   const list: Tile[] = []
   if (usage.contextPercent === undefined) {
     list.push({ id: 'context', label: 'Context window', sub: `等第一次回應後顯示（${fmtTokens(usage.window)}）` })
@@ -138,12 +143,16 @@ function tilesOf(usage: UsageSnap): Tile[] {
   }
   for (const l of usage.limits) {
     const at = l.resetsAt ? Date.parse(l.resetsAt) : Number.NaN
+    // 重置時間已過：這個讀數屬於上一個時間窗，額度已經回滿
+    const isReset = Number.isFinite(at) && at <= now
+    const used = isReset ? 0 : l.percentUsed
     list.push({
       id: l.kind,
       label: limitLabel(l.kind),
-      remaining: clamp(100 - l.percentUsed),
-      sub: `已用 ${round1(l.percentUsed)}%`,
+      remaining: clamp(100 - used),
+      sub: `已用 ${round1(used)}%`,
       resetsAt: Number.isNaN(at) ? undefined : at,
+      isReset: isReset || undefined,
     })
   }
   return list
@@ -171,7 +180,7 @@ async function setOrder($: Api, ids: readonly string[]) {
 async function moveTile($: Api, id: string, to: number) {
   const usage = await read($, usageAtom)
   if (!usage) return
-  const shown = sortByOrder(tilesOf(usage), await read($, orderAtom)).map(m => m.id)
+  const shown = sortByOrder(tilesOf(usage, 0), await read($, orderAtom)).map(m => m.id)
   const from = shown.indexOf(id)
   if (from === -1) return
   const target = Math.max(0, Math.min(shown.length - 1, to))
@@ -192,9 +201,14 @@ function tilesData(tiles: Tile[], b: Breakdown | null): BoardTile[] {
     id: t.id,
     kind: t.id === 'context' ? 'context' : 'limit',
     label: t.label,
-    remaining: t.remaining,
+    // 壓縮後 /context 的細項先更新、上一則回應的數字還是舊的：有細項就用細項算剩餘，跟「已用」一致
+    remaining:
+      t.id === 'context' && b && b.contextWindow > 0
+        ? round1(clamp(100 - (b.tokensUsed / b.contextWindow) * 100))
+        : t.remaining,
     sub: t.sub,
     resetsAt: t.resetsAt,
+    isReset: t.isReset,
     ctx:
       t.id === 'context' && b
         ? {
@@ -220,12 +234,84 @@ async function saveUsage(
     contextPercent: context.percent,
     tokens: context.tokens,
     window: context.window,
-    limits: rateLimits.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt })),
+    limits: await shareLimits(
+      $,
+      rateLimits.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt })),
+    ),
   }
   const old = await read($, usageAtom)
   // 數字沒變就不寫，避免面板白白重繪
   if (old && JSON.stringify(old) === JSON.stringify(snap)) return
   await update($, usageAtom, () => snap)
+  if (!old || JSON.stringify(old.limits) !== JSON.stringify(snap.limits)) await scheduleResetRedraw($, snap.limits)
+}
+
+// 兩個讀數挑比較新的：同一個時間窗取已用較多的（用量只會增加），不同時間窗取較晚重置的
+function newerLimit(x: Limit, y: Limit): Limit {
+  const tx = x.resetsAt ? Date.parse(x.resetsAt) : Number.NaN
+  const ty = y.resetsAt ? Date.parse(y.resetsAt) : Number.NaN
+  if (Number.isFinite(tx) && Number.isFinite(ty) && Math.abs(tx - ty) > SAME_WINDOW_MS) return ty > tx ? y : x
+  if (!Number.isFinite(tx) && Number.isFinite(ty)) return y
+  return y.percentUsed > x.percentUsed ? y : x
+}
+
+function mergeLimits(a: readonly Limit[], b: readonly Limit[]): Limit[] {
+  const out = new Map<string, Limit>()
+  for (const l of [...a, ...b]) {
+    const cur = out.get(l.kind)
+    out.set(l.kind, cur ? newerLimit(cur, l) : l)
+  }
+  return JSON.parse(JSON.stringify([...out.values()])) as Limit[]
+}
+
+async function storedLimits($: Api): Promise<Limit[]> {
+  const v = await $.store.get(LIMITS_KEY)
+  if (!Array.isArray(v)) return []
+  return v.filter(
+    (l): l is Limit =>
+      !!l && typeof l === 'object' && typeof (l as Limit).kind === 'string' && typeof (l as Limit).percentUsed === 'number',
+  )
+}
+
+// 這個 session 的讀數和其他 session 分享的合併；有更新就寫回共用儲存區
+async function shareLimits($: Api, local: Limit[]): Promise<Limit[]> {
+  const stored = await storedLimits($)
+  const merged = mergeLimits(local, stored)
+  if (merged.length > 0 && JSON.stringify(merged) !== JSON.stringify(mergeLimits(stored, []))) await $.store.set(LIMITS_KEY, merged)
+  return merged
+}
+
+// 閒置的 session 不會收到新的 API 回應：定期看其他 session 有沒有更新的額度
+async function syncSharedLimits($: Api) {
+  const cur = await read($, usageAtom)
+  if (!cur) return
+  const merged = mergeLimits(cur.limits, await storedLimits($))
+  if (JSON.stringify(merged) === JSON.stringify(cur.limits)) return
+  await update($, usageAtom, u => (u ? { ...u, limits: merged } : u))
+  await scheduleResetRedraw($, merged)
+}
+
+let limitsSync: Timer | undefined
+let resetRedraw: Timer | undefined
+
+// 到下一個重置時間就重畫一次，讓額度自己回到 100%
+async function scheduleResetRedraw($: Api, limits: readonly Limit[]) {
+  const now = await $.clock.now()
+  const next = limits
+    .map(l => (l.resetsAt ? Date.parse(l.resetsAt) : Number.NaN))
+    .filter(t => Number.isFinite(t) && t > now)
+    .sort((a, b) => a - b)[0]
+  resetRedraw?.cancel()
+  resetRedraw = undefined
+  if (next === undefined) return
+  try {
+    resetRedraw = $.clock.after(next - now + 500, () => {
+      resetRedraw = undefined
+      $.ui.invalidate('ui.render')
+    })
+  } catch {
+    resetRedraw = undefined
+  }
 }
 
 // 自訂的分類顏色（其他分類沿用原版 /context 的主題色）
@@ -285,6 +371,16 @@ async function refresh($: Api, isForced = false) {
       void refresh($)
     })
   }
+}
+
+// 右上角的 Reload：只在面板裡重新抓資料，不在對話裡送出任何指令
+async function reloadPanel($: Api) {
+  await refresh($, true)
+  await tickOnce($).catch(() => undefined)
+  const u = await read($, usageAtom)
+  if (u) await scheduleResetRedraw($, u.limits)
+  $.ui.invalidate('ui.render')
+  $.ui.toast('Claude 監控已重新整理', { timeoutMs: 1500 })
 }
 
 async function finish($: Api, match: (r: AgentRow) => boolean, isFailed: boolean) {
@@ -350,6 +446,12 @@ export const register: Register = on => {
     if (Array.isArray(saved))
       await update($, orderAtom, () => saved.filter((x): x is string => typeof x === 'string'))
     await refresh($, true)
+    limitsSync?.cancel()
+    try {
+      limitsSync = $.clock.every(LIMITS_SYNC_MS, () => void syncSharedLimits($))
+    } catch {
+      limitsSync = undefined
+    }
     const rows = await read($, agentsAtom)
     if (rows.some(r => r.status === 'running')) ensureTicker($)
 
@@ -514,7 +616,7 @@ export const register: Register = on => {
 
     // 可收折的區塊標題：點標題（▾／▸）就收起或展開；收起時只剩標題
     const isOpen = (id: string) => !collapsed.includes(id)
-    const section = (id: string, title: string, right?: unknown, isSub = false) => (
+    const section = (id: string, title: string, right?: unknown, isSub = false, always?: unknown) => (
       <Box flexDirection="row" justifyContent="space-between" alignItems="center" marginTop={1}>
         <Button key={`fold-${id}`} plain onPress={() => void toggleSection($, id)}>
           <Text bold size={isSub ? undefined : 'heading'} dimColor={isSub}>
@@ -522,12 +624,24 @@ export const register: Register = on => {
             {title}
           </Text>
         </Button>
-        {isOpen(id) ? right : null}
+        {always ? (
+          <Box flexDirection="row" alignItems="center" gap={1}>
+            {isOpen(id) ? right : null}
+            {always}
+          </Box>
+        ) : isOpen(id) ? (
+          right
+        ) : null}
       </Box>
     )
 
+    // 右上角：重新整理面板資料（不碰對話）
+    const reloadButton = (
+      <Button key="reload" label="↻ Reload" plain dimColor onPress={() => void reloadPanel($)} />
+    )
+
     // ---- Token 方塊 ----
-    const boardTiles = usage ? toBoardTiles(sortByOrder(tilesOf(usage), order), breakdown) : []
+    const boardTiles = usage ? toBoardTiles(sortByOrder(tilesOf(usage, now), order), breakdown) : []
 
     // 沒有拖曳能力的介面（VS Code、手機）：靜態方塊 + ◀▶
     const staticTile = (t: BoardTile, idx: number, count: number) => {
@@ -594,7 +708,9 @@ export const register: Register = on => {
                 </Text>
               )}
               <Text dimColor>{t.sub}</Text>
-              {t.resetsAt !== undefined && <Text dimColor>{fmtDuration(t.resetsAt - now)} 後重置</Text>}
+              {t.resetsAt !== undefined && (
+                <Text dimColor>{t.isReset || t.resetsAt <= now ? '已重置' : `${fmtDuration(t.resetsAt - now)} 後重置`}</Text>
+              )}
             </Box>
           )}
         </Box>
@@ -715,7 +831,7 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" paddingX={1}>
-        {section('token', 'Token 剩餘')}
+        {section('token', 'Token 剩餘', undefined, false, reloadButton)}
         {isOpen('token') && (
         <Box flexDirection="column" marginTop={1}>
           {!usage && <Text dimColor>讀取中…</Text>}

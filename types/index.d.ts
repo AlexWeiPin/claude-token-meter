@@ -57,6 +57,8 @@ export type BoardTile = {
   remaining?: number
   sub: string
   resetsAt?: number
+  /** 重置時間已過（讀數屬於上一個時間窗） */
+  isReset?: boolean
   ctx?: {
     model: string
     tokensUsed: number

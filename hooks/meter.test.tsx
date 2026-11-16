@@ -64,7 +64,12 @@ const LIMITS = [
 
 type On = Parameters<Parameters<typeof test>[1]>[1]
 
-function engine(on: On, toasts: string[] = [], clock: () => number = () => 1_000_000) {
+function engine(
+  on: On,
+  toasts: string[] = [],
+  clock: () => number = () => 1_000_000,
+  ctx: { percent: number; breakdown: typeof BREAKDOWN } = { percent: 20, breakdown: BREAKDOWN },
+) {
   mock.store(on)
   on('clock.now', () => ({ value: clock() }))
   on('clock.every', () => ({ value: { cancel() {} } }))
@@ -81,14 +86,15 @@ function engine(on: On, toasts: string[] = [], clock: () => number = () => 1_000
       context: {
         tokens: 40_000,
         window: 200_000,
-        percent: 20,
-        ...((e as { breakdown?: string } | undefined)?.breakdown ? { breakdown: BREAKDOWN } : {}),
+        percent: ctx.percent,
+        ...((e as { breakdown?: string } | undefined)?.breakdown ? { breakdown: ctx.breakdown } : {}),
       },
       rateLimits: LIMITS,
     },
   }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('agent.list', () => ({ value: [] }))
+  on('session.surfaces', () => ({ value: ['desktop'] }))
   let spawned = 0
   on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: `a${++spawned}` }))
   on('tool.call', () => ({ result: {} }))
@@ -483,5 +489,129 @@ test('subagent 用掉的 token 即時累加顯示', async ($, on) => {
   await step($, 'a1')
   ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: /8\.4k tokens/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('壓縮後剩餘 % 跟「已用」一致（不用壓縮前的舊數字）', async ($, on) => {
+  // 上一則回應的數字還是壓縮前的 52%，/context 細項已經是壓縮後的 8%
+  engine(on, [], () => 1_000_000, {
+    percent: 52,
+    breakdown: { ...BREAKDOWN, totalTokens: 16_000, categories: BREAKDOWN.categories.map(c => (c.name === 'Messages' ? { ...c, tokens: 13_000 } : c)) },
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const shown = await percents(ui, surface)
+    expect(shown[0]).toBe('92%')
+    expect(shown).not.toContain('48%')
+    await ui.unmount()
+  }
+})
+
+test('右上角的 Reload 按鈕只刷新面板，不在對話送出指令，收起時也在', async ($, on) => {
+  const breakdown = { ...BREAKDOWN }
+  engine(on, [], () => 1_000_000, { percent: 52, breakdown })
+  const ran: string[] = []
+  on('command.run', (_, e) => {
+    ran.push(e.command)
+    return { text: '' }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    breakdown.totalTokens = 40_000 + SURFACES.indexOf(surface) * 20_000
+    await ui.press({ key: 'reload' })
+    expect((await percents(ui, surface))[0]).toBe(`${80 - SURFACES.indexOf(surface) * 10}%`)
+    await ui.press({ key: 'fold-token' })
+    await ui.press({ key: 'reload' })
+    await ui.press({ key: 'fold-token' })
+    await ui.unmount()
+  }
+  expect(ran).toHaveLength(0)
+})
+
+// 共用儲存區用一個看得到的物件，模擬「別的 session」直接改它
+function quotaSession(on: On, shared: Record<string, unknown>, local: { percentUsed: number; resetsAt: string }) {
+  on('store.get', (_, e) => ({ value: shared[e.key] }))
+  on('store.set', (_, e) => {
+    shared[e.key] = JSON.parse(JSON.stringify(e.value))
+    return { value: undefined }
+  })
+  const clock = mock.clock(on, { now: Date.parse('2026-11-16T10:00:00Z') })
+  on('command.register', () => ({ value: { command: 'meter' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('agent.list', () => ({ value: [] }))
+  on('session.surfaces', () => ({ value: ['desktop'] }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('session.usage', () => ({
+    value: {
+      startedAt: 0,
+      context: { tokens: 1, window: 10, percent: 10 },
+      rateLimits: [{ kind: 'five_hour', ...local }],
+    },
+  }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  return clock
+}
+
+const RESET = '2026-11-16T13:00:00Z'
+
+test('額度跨 session 共用：閒置 session 顯示別的 session 讀到的最新額度', async ($, on) => {
+  // 這個 session 上次讀到已用 55%；別的 session 剛讀到同一時間窗已用 96%
+  const shared: Record<string, unknown> = { 'limits-latest': [{ kind: 'five_hour', percentUsed: 96, resetsAt: RESET }] }
+  const clock = quotaSession(on, shared, { percentUsed: 55, resetsAt: RESET })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await percents(ui, 'desktop')).toContain('4%')
+  expect(await percents(ui, 'desktop')).not.toContain('45%')
+
+  // 別的 session 又讀到 97%：什麼都不按，30 秒內自己更新
+  shared['limits-latest'] = [{ kind: 'five_hour', percentUsed: 97, resetsAt: RESET }]
+  await clock.advance(30_000)
+  expect(await percents(ui, 'desktop')).toContain('3%')
+
+  // 再讀到 98%：按 Reload 立刻更新
+  shared['limits-latest'] = [{ kind: 'five_hour', percentUsed: 98, resetsAt: RESET }]
+  await ui.press({ key: 'reload' })
+  expect(await percents(ui, 'desktop')).toContain('2%')
+  await ui.unmount()
+})
+
+test('額度跨 session 共用：時間窗重置後，舊時間窗的高用量不會蓋掉新的', async ($, on) => {
+  const shared: Record<string, unknown> = {
+    'limits-latest': [{ kind: 'five_hour', percentUsed: 96, resetsAt: '2026-11-16T08:00:00Z' }],
+  }
+  quotaSession(on, shared, { percentUsed: 10, resetsAt: RESET })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await percents(ui, 'desktop')).toContain('90%')
+  expect(shared['limits-latest']).toEqual([{ kind: 'five_hour', percentUsed: 10, resetsAt: RESET }])
+  await ui.unmount()
+})
+
+test('重置時間已過：額度回到 100%，顯示「已重置」，不會卡在 0s', async ($, on) => {
+  quotaSession(on, {}, { percentUsed: 99, resetsAt: '2026-11-16T09:00:00Z' })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const scope = BOARD_SURFACES.has(surface) ? { in: 'board' } : {}
+    expect(await percents(ui, surface)).toContain('100%')
+    expect(await percents(ui, surface)).not.toContain('1%')
+    expect(await ui.find({ type: 'Text', text: /已重置/, ...scope })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /後重置/, ...scope })).toBeUndefined()
+    await ui.unmount()
+  }
+})
+
+test('到了重置時間，面板自己變回 100%', async ($, on) => {
+  const clock = quotaSession(on, {}, { percentUsed: 99, resetsAt: '2026-11-16T10:05:00Z' })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  expect(await percents(ui, 'vscode')).toContain('1%')
+  await clock.advance(6 * 60_000)
+  expect(await percents(ui, 'vscode')).toContain('100%')
+  expect(await ui.find({ type: 'Text', text: /已重置/ })).toBeDefined()
   await ui.unmount()
 })

@@ -359,7 +359,7 @@ const TokenBoard: ClientModule<BoardProps, State> = (props, surface) => {
         </Text>
         {t.resetsAt !== undefined && (
           <Text dimColor wrap="truncate-end">
-            {fmt(t.resetsAt - now)} 後重置
+            {t.isReset || t.resetsAt <= now ? '已重置' : `${fmt(t.resetsAt - now)} 後重置`}
           </Text>
         )}
       </Box>
@@ -390,7 +390,10 @@ const TokenBoard: ClientModule<BoardProps, State> = (props, surface) => {
     )
   }
 
-  const tiles = props.tiles.filter(t => target[t.id])
+  // 額度的重置時間到了：舊讀數作廢，當作全部剩下（等下一次回應帶回新的時間窗）
+  const tiles = props.tiles
+    .filter(t => target[t.id])
+    .map(t => (t.kind === 'limit' && t.resetsAt !== undefined && (t.isReset || t.resetsAt <= now) ? { ...t, remaining: 100, sub: '已用 0%' } : t))
   // 拖曳中的方塊最後畫，浮在其他方塊上面
   const lifted = tiles.find(t => t.id === dragId)
 

@@ -16,6 +16,8 @@ token-meter 是一個 Claude Code 外掛（mod），會在 Claude Code 旁邊加
 ### 1. Token 剩餘
 
 - 以磁貼顯示 Context window 剩餘百分比；訂閱方案另外顯示 5 小時額度與每週額度的剩餘百分比，並附即時重置倒數。
+- 額度是整個帳號共用的：各 session 會互相分享最新讀到的額度，閒置的 session 每 30 秒自動同步；重置時間一過就顯示 100%（已重置）。
+- 標題列右側的 **↻ Reload** 會立即重新整理面板資料，不會在對話中送出任何指令。
 - 磁貼可調整順序：桌面版與終端機版可直接拖曳（流暢、類似 Miro 的手感），其他環境則用 ◀ ▶ 按鈕。排列順序會被記住。
 - Context window 磁貼對應桌面版內建的 context 摘要：顯示已用 / 總 token 數、前 6 大類別的細長堆疊長條（Messages 為淺藍、MCP tools 為紫色、System prompt 為棕色，其餘沿用 `/context` 的原始配色），並以一條細紅線標出觸發 auto-compact 的位置。
 
@@ -61,6 +63,7 @@ AlexWeiPin/claude-token-meter
 
 - `/meter`：重新開啟「Claude 監控」面板。
 - 點擊區塊標題收合或展開該區塊。
+- 按右上角的 ↻ Reload 重新整理面板資料。
 - 拖曳 Token 剩餘磁貼（或按 ◀ ▶）調整順序。
 
 ## 開發
