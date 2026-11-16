@@ -1,0 +1,9 @@
+{
+  "name": "token-meter",
+  "version": "1.0.0",
+  "description": "側欄面板：顯示 Claude token 剩餘百分比（context 與用量額度）、Context 細項、使用中的 skills，以及 subagent 執行中的即時動畫",
+  "author": { "name": "AlexWeiPin" },
+  "license": "MIT",
+  "repository": "https://github.com/AlexWeiPin/claude-token-meter",
+  "types": "./types/index.d.ts"
+}

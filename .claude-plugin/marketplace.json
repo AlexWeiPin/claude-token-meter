@@ -1,0 +1,14 @@
+{
+  "name": "claude-token-meter",
+  "owner": {
+    "name": "AlexWeiPin"
+  },
+  "description": "token-meter：Claude Code 側欄監控面板",
+  "plugins": [
+    {
+      "name": "token-meter",
+      "source": "./",
+      "description": "側欄面板：Token 剩餘、Context 細項、Skills 與 subagent 即時動畫"
+    }
+  ]
+}
