@@ -441,7 +441,7 @@ function engineWithSteps(on: On, clock: () => number) {
   })
 }
 
-test('一批 subagent：先完成的留著變淺橘色，全部完成才一起移到最近完成', async ($, on) => {
+test('一批 subagent：先完成的留著變綠色，全部完成才一起移到最近完成', async ($, on) => {
   let now = 1_000_000
   engineWithSteps(on, () => now)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
@@ -453,9 +453,16 @@ test('一批 subagent：先完成的留著變淺橘色，全部完成才一起�
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await ui.find({ type: 'Text', text: /2 個執行中/ })).toBeDefined()
-    // 甲還在上面，標示已完成、淺橘色
+    // 甲還在上面，標示已完成、綠色
     const done = await ui.find({ type: 'Text', text: /Explore.*已完成/ })
-    expect((done?.props as { color?: string }).color).toBe('#F2B58C')
+    expect((done?.props as { color?: string }).color).toBe('#4CC38A')
+    // 還在跑的乙、丙：各自不同顏色，都不是綠色
+    const runningColors = (await ui.findAll({ type: 'Box' }))
+      .filter(b => String(b.key ?? '').startsWith('agent-'))
+      .map(b => (b.props as { borderColor?: string }).borderColor)
+    expect(runningColors[0]).toBe('#4CC38A')
+    expect(new Set(runningColors.slice(1)).size).toBe(2)
+    expect(runningColors.slice(1)).not.toContain('#4CC38A')
     expect(await ui.find({ type: 'Text', text: /最近完成/ })).toBeUndefined()
     // 三個方塊都是整列寬
     const tiles = (await ui.findAll({ type: 'Box' }))
@@ -532,6 +539,10 @@ test('右上角的 Reload 按鈕只刷新面板，不在對話送出指令，收
   expect(ran).toHaveLength(0)
 })
 
+// 測試時間以真實的現在為準（看板的倒數用的是真實時鐘）
+const NOW = Date.now()
+const at = (offsetMs: number) => new Date(NOW + offsetMs).toISOString()
+
 // 共用儲存區用一個看得到的物件，模擬「別的 session」直接改它
 function quotaSession(on: On, shared: Record<string, unknown>, local: { percentUsed: number; resetsAt: string }) {
   on('store.get', (_, e) => ({ value: shared[e.key] }))
@@ -539,7 +550,7 @@ function quotaSession(on: On, shared: Record<string, unknown>, local: { percentU
     shared[e.key] = JSON.parse(JSON.stringify(e.value))
     return { value: undefined }
   })
-  const clock = mock.clock(on, { now: Date.parse('2026-11-16T10:00:00Z') })
+  const clock = mock.clock(on, { now: NOW })
   on('command.register', () => ({ value: { command: 'meter' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('agent.list', () => ({ value: [] }))
@@ -556,7 +567,7 @@ function quotaSession(on: On, shared: Record<string, unknown>, local: { percentU
   return clock
 }
 
-const RESET = '2026-11-16T13:00:00Z'
+const RESET = at(3 * 60 * 60_000)
 
 test('額度跨 session 共用：閒置 session 顯示別的 session 讀到的最新額度', async ($, on) => {
   // 這個 session 上次讀到已用 55%；別的 session 剛讀到同一時間窗已用 96%
@@ -581,7 +592,7 @@ test('額度跨 session 共用：閒置 session 顯示別的 session 讀到的�
 
 test('額度跨 session 共用：時間窗重置後，舊時間窗的高用量不會蓋掉新的', async ($, on) => {
   const shared: Record<string, unknown> = {
-    'limits-latest': [{ kind: 'five_hour', percentUsed: 96, resetsAt: '2026-11-16T08:00:00Z' }],
+    'limits-latest': [{ kind: 'five_hour', percentUsed: 96, resetsAt: at(-2 * 60 * 60_000) }],
   }
   quotaSession(on, shared, { percentUsed: 10, resetsAt: RESET })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
@@ -592,7 +603,7 @@ test('額度跨 session 共用：時間窗重置後，舊時間窗的高用量�
 })
 
 test('重置時間已過：額度回到 100%，顯示「已重置」，不會卡在 0s', async ($, on) => {
-  quotaSession(on, {}, { percentUsed: 99, resetsAt: '2026-11-16T09:00:00Z' })
+  quotaSession(on, {}, { percentUsed: 99, resetsAt: at(-60 * 60_000) })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ ...PANE, surface })
@@ -606,12 +617,27 @@ test('重置時間已過：額度回到 100%，顯示「已重置」，不會卡
 })
 
 test('到了重置時間，面板自己變回 100%', async ($, on) => {
-  const clock = quotaSession(on, {}, { percentUsed: 99, resetsAt: '2026-11-16T10:05:00Z' })
+  const clock = quotaSession(on, {}, { percentUsed: 99, resetsAt: at(5 * 60_000) })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
   expect(await percents(ui, 'vscode')).toContain('1%')
   await clock.advance(6 * 60_000)
   expect(await percents(ui, 'vscode')).toContain('100%')
   expect(await ui.find({ type: 'Text', text: /已重置/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('同時派出的 subagent 動畫各是不同顏色（即使類型一樣）', async ($, on) => {
+  engineWithSteps(on, () => 1_000_000)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  for (const d of ['一', '二', '三', '四']) await $.agent.spawn({ prompt: 'x', description: d, subagentType: 'Explore' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const svgs = (await ui.findAll({ type: 'Svg' }))
+    .map(n => String((n.props as { source?: string }).source ?? ''))
+    .filter(src => src.includes('animateTransform'))
+  const colors = svgs.map(src => /fill="(#[0-9A-Fa-f]{6})"/.exec(src)?.[1])
+  expect(colors).toHaveLength(4)
+  expect(new Set(colors).size).toBe(4)
+  expect(colors).not.toContain('#4CC38A')
   await ui.unmount()
 })

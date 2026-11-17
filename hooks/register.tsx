@@ -83,7 +83,8 @@ function textBar(remaining: number, width = 14): string {
   return '━'.repeat(full)
 }
 
-const PALETTE = ['#D97757', '#6A9BD8', '#58B48C', '#B07CD8', '#E0A030', '#D86A9B']
+// 執行中的顏色（刻意不含綠色：綠色留給「已完成」）
+const PALETTE = ['#D97757', '#6A9BD8', '#B07CD8', '#E0A030', '#D86A9B', '#4FB8D0']
 function colorFor(type: string): string {
   let h = 0
   for (const c of type) h = (h * 31 + c.charCodeAt(0)) >>> 0
@@ -117,8 +118,9 @@ function idleSvg(): string {
 </svg>`
 }
 
-// 同一批裡已經完成、還在等其他 subagent 的方塊：淺橘色
-const DONE_IN_BATCH = '#F2B58C'
+// 已完成的 subagent：綠色
+const DONE_COLOR = '#4CC38A'
+const FAILED_COLOR = 'error'
 
 const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
@@ -774,11 +776,18 @@ export const register: Register = on => {
       .sort((x, y) => (y.endedAt ?? 0) - (x.endedAt ?? 0))
       .slice(0, 4)
 
+    // 同一批裡每個 subagent 各用一個顏色（依派出順序），完成後變綠色
+    const runColor = (a: AgentRow) => {
+      const i = batch.findIndex(b => b.id === a.id)
+      return i >= 0 ? PALETTE[i % PALETTE.length]! : colorFor(a.type)
+    }
     const agentTile = (a: AgentRow, isInBatch = false) => {
       const isRunning = a.status === 'running'
-      // 同一批裡先完成的：淺橘色；最近完成區：灰色
+      const isFailed = a.status === 'failed'
+      // 同一批裡先完成的：綠色、文字清楚；最近完成區：綠色框、文字淡
       const isBatchDone = isInBatch && !isRunning
-      const accent = isRunning ? colorFor(a.type) : isBatchDone ? DONE_IN_BATCH : undefined
+      const doneColor = isFailed ? FAILED_COLOR : DONE_COLOR
+      const accent = isRunning ? runColor(a) : doneColor
       return (
         <Box
           key={`agent-${a.id}`}
@@ -787,29 +796,29 @@ export const register: Register = on => {
           gap={1}
           borderStyle="round"
           borderColor={accent}
-          borderDimColor={!accent}
+          borderDimColor={!isRunning && !isBatchDone}
           paddingX={1}
           width="100%"
           marginBottom={1}
         >
           {isRunning ? (
             Svg ? (
-              <Svg source={runningSvg(colorFor(a.type))} alt="執行中" isInteractive width={30} height={30} />
+              <Svg source={runningSvg(runColor(a))} alt="執行中" isInteractive width={30} height={30} />
             ) : (
-              <Text color="claude">{SPIN[tick % SPIN.length]}</Text>
+              <Text color={runColor(a)}>{SPIN[tick % SPIN.length]}</Text>
             )
           ) : (
-            <Text color={isBatchDone ? DONE_IN_BATCH : a.status === 'done' ? 'success' : 'error'}>
+            <Text color={doneColor}>
               {a.status === 'failed' ? '✗' : '✓'}
             </Text>
           )}
           <Box flexDirection="column" flexShrink={1} flexGrow={1}>
-            <Text bold color={accent} dimColor={!accent}>
+            <Text bold color={accent}>
               {a.type}
               {a.isBackground ? ' · 背景' : ''}
-              {isBatchDone ? ' · 已完成' : ''}
+              {isBatchDone ? (isFailed ? ' · 失敗' : ' · 已完成') : ''}
             </Text>
-            <Text color={isBatchDone ? DONE_IN_BATCH : undefined} dimColor={!isRunning && !isBatchDone}>
+            <Text color={isBatchDone ? doneColor : undefined} dimColor={!isRunning && !isBatchDone}>
               {a.description}
             </Text>
             {isRunning ? (
@@ -820,7 +829,7 @@ export const register: Register = on => {
                 {liveTime(`elapsed-${a.id}`, a.startedAt, 'since')}
               </Box>
             ) : (
-              <Text color={isBatchDone ? DONE_IN_BATCH : undefined} dimColor={!isBatchDone}>
+              <Text color={isBatchDone ? doneColor : undefined} dimColor={!isBatchDone}>
                 {a.toolCount} 次工具 · {fmtTokens(a.tokens ?? 0)} tokens · {fmtDuration((a.endedAt ?? now) - a.startedAt)}
               </Text>
             )}
