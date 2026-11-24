@@ -11,7 +11,7 @@ token-meter 是一個 Claude Code 外掛（mod），會在 Claude Code 旁邊加
 
 ## 功能
 
-面板分為三個區塊。點擊區塊標題的 ▾ / ▸ 即可收合或展開，收合狀態會跨 session 保留。
+面板分為四個區塊。點擊區塊標題的 ▾ / ▸ 即可收合或展開，收合狀態會跨 session 保留。
 
 ### 1. Token 剩餘
 
@@ -30,6 +30,12 @@ token-meter 是一個 Claude Code 外掛（mod），會在 Claude Code 旁邊加
 
 - 只顯示 Claude 真正呼叫過的 skill。
 - 當前回合使用中的 skill 會以帶動畫的「使用中」磁貼呈現，之後列入「這個 session 用過」清單，並顯示使用次數。
+
+### 4. 輸出內容
+
+- 列出 Claude 在這個 session 用 Write 寫出的文件（報告、筆記等），最新的在最上方，顯示檔名、所在資料夾與寫入時間。
+- 只收文件類檔案：`.md`、`.txt`、`.html`、`.csv`、`.tsv`、`.json`、`.yaml`、`.xml`、`.log`、`.rst`。程式碼和 `~/.claude` 底下的設定、記憶檔不列入。
+- 點檔名會在 Claude 裡開一個預覽窗：Markdown 直接排版顯示，其他格式以程式碼區塊顯示；預覽窗可重新讀取、複製路徑或關閉，不會跳到外部程式。
 
 ## 安裝
 
@@ -65,6 +71,7 @@ AlexWeiPin/claude-token-meter
 - 點擊區塊標題收合或展開該區塊。
 - 按右上角的 ↻ Reload 重新整理面板資料。
 - 拖曳 Token 剩餘磁貼（或按 ◀ ▶）調整順序。
+- 點「輸出內容」裡的檔名，在 Claude 裡預覽那份文件。
 
 ## 開發
 

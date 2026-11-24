@@ -49,6 +49,31 @@ export type AgentRow = {
 /** 這個 session 裡 Claude 呼叫過的 skill */
 export type SkillUse = { name: string; count: number; lastAt: number; pluginName?: string }
 
+/** Claude 在這個 session 用 Write 產出的文件 */
+export type OutputFile = {
+  /** 絕對路徑 */
+  path: string
+  /** 檔名 */
+  name: string
+  /** 最後一次寫入的時間 */
+  at: number
+  /** 寫了幾次（覆寫也算） */
+  count: number
+  /** 由哪個 subagent 寫的；主對話寫的沒有 */
+  agentId?: string
+}
+
+/** 預覽窗正在顯示的文件 */
+export type OpenDoc = {
+  path: string
+  name: string
+  /** 讀到的內容（太大只讀前段） */
+  text: string
+  isTruncated: boolean
+  /** 讀不到時的原因（檔案被刪、權限…） */
+  error?: string
+}
+
 /** Token 看板裡的一個方塊（傳給 token-board.tsx 的資料） */
 export type BoardTile = {
   id: string
@@ -88,6 +113,10 @@ declare module 'claude-code' {
       order: string[]
       /** 收起來的區塊 id（token、subagents、recent、skills、skills-used） */
       collapsed: string[]
+      /** Claude 產出的文件，最新的在最後 */
+      outputs: Shaped<OutputFile[]>
+      /** 預覽窗正在顯示的文件 */
+      doc: Shaped<OpenDoc | null>
     }
   }
 }

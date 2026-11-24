@@ -62,6 +62,9 @@ const LIMITS = [
   { kind: 'seven_day', percentUsed: 90 },
 ]
 
+// 測試期間開過的 pane id
+const openedPanes: string[] = []
+
 type On = Parameters<Parameters<typeof test>[1]>[1]
 
 function engine(
@@ -75,7 +78,10 @@ function engine(
   on('clock.every', () => ({ value: { cancel() {} } }))
   on('clock.after', () => ({ value: { cancel() {} } }))
   on('command.register', () => ({ value: { command: 'meter' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.open', (_, e) => {
+    openedPanes.push((e as { id: string }).id)
+    return { value: { isPlaced: true } }
+  })
   on('ui.toast', (_, e) => {
     toasts.push(JSON.stringify(e))
     return { value: undefined }
@@ -640,4 +646,50 @@ test('同時派出的 subagent 動畫各是不同顏色（即使類型一樣）'
   expect(new Set(colors).size).toBe(4)
   expect(colors).not.toContain('#4CC38A')
   await ui.unmount()
+})
+
+test('輸出內容：Claude 寫出的文件列在面板，點了在 Claude 裡的預覽窗打開', async ($, on) => {
+  engine(on)
+  openedPanes.length = 0
+  on('fs.stat', () => ({ value: { kind: 'file', size: 40, mtimeMs: 0, isLink: false } }))
+  on('fs.read', () => ({ value: '# 週報\n\n本週完成三件事' }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Write', file_path: '/Users/me/reports/weekly.md', content: '# 週報' })
+  await $.tool.call({ tool: 'Write', file_path: '/Users/me/app/main.ts', content: 'x' })
+  await $.tool.call({ tool: 'Write', file_path: '/Users/me/.claude/memory/note.md', content: 'x' })
+  await $.tool.call({ tool: 'Write', file_path: '/Users/me/reports/data.csv', content: 'a,b' })
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: /輸出內容/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^weekly\.md$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^data\.csv$/ })).toBeDefined()
+    // 程式碼、Claude 自己的記憶檔不算輸出內容
+    expect(await ui.find({ type: 'Text', text: /main\.ts/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /note\.md/ })).toBeUndefined()
+    await ui.unmount()
+  }
+
+  // 最新的在最上面：out-0 是 data.csv，out-1 是 weekly.md
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'out-1' })
+  expect(openedPanes).toContain('token-meter-doc')
+
+  const doc = await $.ui.mount({ ...PANE, requestId: 'token-meter-doc', surface: 'desktop' })
+  expect(await doc.find({ type: 'Text', text: /^weekly\.md$/ })).toBeDefined()
+  expect(await doc.find({ type: 'Text', text: /\/Users\/me\/reports\/weekly\.md/ })).toBeDefined()
+  expect(await doc.find({ type: 'Markdown' })).toBeDefined()
+})
+
+test('輸出內容：檔案被刪掉時預覽窗說讀不到，不會壞掉', async ($, on) => {
+  engine(on)
+  on('fs.stat', () => {
+    throw new Error('ENOENT: no such file')
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Write', file_path: '/Users/me/reports/gone.md', content: 'x' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'out-0' })
+  const doc = await $.ui.mount({ ...PANE, requestId: 'token-meter-doc', surface: 'desktop' })
+  expect(await doc.find({ type: 'Text', text: /讀不到這個檔案/ })).toBeDefined()
 })

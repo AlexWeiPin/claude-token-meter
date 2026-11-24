@@ -6,7 +6,9 @@ import type {
   BoardTile,
   Breakdown,
   Limit,
+  OpenDoc,
   OrderMessage,
+  OutputFile,
   SkillUse,
   UsageSnap,
 } from '../types'
@@ -41,6 +43,19 @@ const orderAtom = atom({ plugin: 'token-meter', key: 'order' } as const, [])
 // 收起來的區塊（跨 session 存在 $.store）
 const collapsedAtom = atom({ plugin: 'token-meter', key: 'collapsed' } as const, [])
 const COLLAPSED_KEY = 'collapsed'
+// Claude 產出的文件，和看文件用的預覽窗
+const outputsAtom = atom({ plugin: 'token-meter', key: 'outputs' } as const, [], {
+  shape: 'outputs-1',
+})
+const docAtom = atom({ plugin: 'token-meter', key: 'doc' } as const, null, {
+  shape: 'doc-1',
+})
+const DOC_PANE = 'token-meter-doc'
+// 只收「文件」類的檔案（程式碼不算輸出內容）
+const DOC_EXTS = new Set(['md', 'markdown', 'txt', 'html', 'htm', 'csv', 'tsv', 'json', 'yaml', 'yml', 'xml', 'log', 'rst'])
+// 預覽最多讀這麼多 bytes（畫面一次最多畫 100000 字）
+const DOC_MAX_BYTES = 90_000
+const OUTPUTS_SHOWN = 8
 
 type Api = EngineInterface
 
@@ -431,6 +446,53 @@ async function tickOnce($: Api) {
   }
 }
 
+// ---------- 輸出內容 ----------
+
+const extOf = (path: string) => {
+  const name = baseName(path)
+  const dot = name.lastIndexOf('.')
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : ''
+}
+const baseName = (path: string) => path.slice(path.lastIndexOf('/') + 1)
+const dirName = (path: string) => {
+  const parts = path.split('/').filter(Boolean)
+  return parts.length > 1 ? parts[parts.length - 2]! : '/'
+}
+
+// 文件類檔案才算；Claude 自己的設定、記憶、計畫（~/.claude 底下）不算
+function isOutputDoc(path: string): boolean {
+  return path.startsWith('/') && DOC_EXTS.has(extOf(path)) && !path.includes('/.claude/')
+}
+
+async function recordOutput($: Api, path: string, agentId?: string) {
+  const now = await $.clock.now()
+  await update($, outputsAtom, list => {
+    const found = list.find(f => f.path === path)
+    const row: OutputFile = found
+      ? { ...found, at: now, count: found.count + 1 }
+      : { path, name: baseName(path), at: now, count: 1, ...(agentId ? { agentId } : {}) }
+    return [...list.filter(f => f.path !== path), row].slice(-50)
+  })
+}
+
+async function loadDoc($: Api, path: string): Promise<OpenDoc> {
+  const name = baseName(path)
+  try {
+    const { size } = await $.fs.stat(path)
+    const text = await $.fs.read(path, { length: DOC_MAX_BYTES })
+    return { path, name, text, isTruncated: size > DOC_MAX_BYTES }
+  } catch (err) {
+    return { path, name, text: '', isTruncated: false, error: String(err instanceof Error ? err.message : err) }
+  }
+}
+
+// 在 Claude 裡開一個預覽窗顯示文件（不交給外部程式）
+async function openDoc($: Api, path: string) {
+  const doc = await loadDoc($, path)
+  await update($, docAtom, () => doc)
+  await $.ui.open({ id: DOC_PANE, title: `📄 ${doc.name}`, focus: true })
+}
+
 // ---------- hooks ----------
 
 export const register: Register = on => {
@@ -552,6 +614,15 @@ export const register: Register = on => {
     return res
   })
 
+  // Claude 寫出文件：記到「輸出內容」
+  on('tool.call', { tool: 'Write' }, async ($, e, next) => {
+    const res = await next(e)
+    if (!res.deny && !res.isError && typeof e.file_path === 'string' && isOutputDoc(e.file_path))
+      await recordOutput($, e.file_path, e.agentId)
+
+    return res
+  })
+
   // subagent 每次呼叫模型：把這次用掉的 token 加到它身上（即時）
   on('turn.step', async function* ($, e, next) {
     const res = yield* next(e)
@@ -601,6 +672,7 @@ export const register: Register = on => {
     const activeSkills = await read($, activeSkillsAtom)
     const order = await read($, orderAtom)
     const collapsed = await read($, collapsedAtom)
+    const outputs = await read($, outputsAtom)
     const tick = isTerminal ? await read($, tickAtom) : 0
     const now = await $.clock.now()
 
@@ -838,6 +910,26 @@ export const register: Register = on => {
       )
     }
 
+    // ---- 輸出內容：Claude 寫出的文件，點了在 Claude 裡預覽 ----
+    const shownOutputs = [...outputs].reverse().slice(0, OUTPUTS_SHOWN)
+    const outputRow = (f: OutputFile, i: number) => (
+      <Box key={`out-row-${i}`} flexDirection="row" alignItems="center" gap={1} width="100%">
+        <Text>📄</Text>
+        <Box flexDirection="column" flexShrink={1} flexGrow={1}>
+          <Button key={`out-${i}`} plain onPress={() => void openDoc($, f.path)}>
+            <Text color="claude" underline>
+              {f.name}
+            </Text>
+          </Button>
+          <Text dimColor>
+            {dirName(f.path)}
+            {f.agentId ? ' · subagent' : ''}
+            {f.count > 1 ? ` · 改寫 ${f.count - 1} 次` : ''} · {fmtDuration(now - f.at)} 前
+          </Text>
+        </Box>
+      </Box>
+    )
+
     return (
       <Box flexDirection="column" paddingX={1}>
         {section('token', 'Token 剩餘', undefined, false, reloadButton)}
@@ -906,6 +998,56 @@ export const register: Register = on => {
           </Box>
         )}
 
+        {section(
+          'outputs',
+          '輸出內容',
+          outputs.length > 0 ? <Text dimColor>{outputs.length} 個檔案</Text> : undefined,
+        )}
+        {isOpen('outputs') && outputs.length > 0 && (
+          <Box flexDirection="column" marginTop={1} gap={1}>
+            {shownOutputs.map(outputRow)}
+            {outputs.length > OUTPUTS_SHOWN && <Text dimColor>還有 {outputs.length - OUTPUTS_SHOWN} 個較早的檔案</Text>}
+          </Box>
+        )}
+      </Box>
+    )
+  })
+
+  // ---------- 文件預覽窗 ----------
+
+  on('ui.render', { component: 'Pane', requestId: DOC_PANE }, async ($, e) => {
+    const { Box, Text, Button, Markdown, Code } = $.ui.resolve(e)
+    const doc = await read($, docAtom)
+    if (!doc) return <Text dimColor>沒有開啟的文件</Text>
+    const ext = extOf(doc.path)
+
+    return (
+      <Box flexDirection="column" paddingX={1} gap={1}>
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
+          <Box flexDirection="column" flexShrink={1}>
+            <Text bold>{doc.name}</Text>
+            <Text dimColor>{doc.path}</Text>
+          </Box>
+          <Box flexDirection="row" gap={1}>
+            <Button key="doc-reload" label="↻ 重新讀取" plain dimColor onPress={() => void openDoc($, doc.path)} />
+            <Button
+              key="doc-copy"
+              label="複製路徑"
+              plain
+              dimColor
+              onPress={press => void $.ui.copy({ text: doc.path, surface: press.surface })}
+            />
+            <Button key="doc-close" label="關閉" plain dimColor role="dismiss" onPress={() => void $.ui.close({ id: DOC_PANE })} />
+          </Box>
+        </Box>
+        {doc.error ? (
+          <Text color="error">讀不到這個檔案：{doc.error}</Text>
+        ) : ext === 'md' || ext === 'markdown' ? (
+          <Markdown key="doc-body" text={doc.text} />
+        ) : (
+          <Code key="doc-body" source={doc.text} path={doc.path} />
+        )}
+        {doc.isTruncated && <Text dimColor>檔案太大，只顯示前面一部分</Text>}
       </Box>
     )
   })
